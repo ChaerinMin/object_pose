@@ -1,0 +1,85 @@
+{
+        "0 0 -1": {
+            "center": "",
+            "cameras": [
+                "brics-odroid-001_cam0",
+                "brics-odroid-002_cam0",
+                "brics-odroid-003_cam0",
+                "brics-odroid-003_cam1",
+                "brics-odroid-004_cam0",
+                "brics-odroid-004_cam1",
+                "brics-odroid-005_cam0",
+                "brics-odroid-005_cam1"
+            ]
+        },
+        "0 0 1": {
+            "center": "brics-odroid-015_cam1",
+            "cameras": [
+                "brics-odroid-011_cam0",
+                "brics-odroid-012_cam0",
+                "brics-odroid-012_cam1",
+                "brics-odroid-013_cam0",
+                "brics-odroid-013_cam1",
+                "brics-odroid-014_cam0",
+                "brics-odroid-014_cam1",
+                "brics-odroid-015_cam0",
+                "brics-odroid-015_cam1"
+            ]
+        },
+        "0 -1 0": {
+            "center": "brics-odroid-030_cam0",
+            "cameras": [
+                "brics-odroid-026_cam0",
+                "brics-odroid-026_cam1",
+                "brics-odroid-027_cam0",
+                "brics-odroid-027_cam1",
+                "brics-odroid-028_cam0",
+                "brics-odroid-029_cam0",
+                "brics-odroid-029_cam1",
+                "brics-odroid-030_cam0",
+                "brics-odroid-030_cam1"
+            ]
+        },
+        "0 1 0": {
+            "center": "brics-odroid-025_cam0",
+            "cameras": [
+                "brics-odroid-021_cam0",
+                "brics-odroid-021_cam1",
+                "brics-odroid-022_cam0",
+                "brics-odroid-022_cam1",
+                "brics-odroid-023_cam0",
+                "brics-odroid-024_cam0",
+                "brics-odroid-024_cam1",
+                "brics-odroid-025_cam0",
+                "brics-odroid-025_cam1"
+            ]
+        },
+        "-1 0 0": {
+            "center": "brics-odroid-010_cam0",
+            "cameras": [
+                "brics-odroid-006_cam0",
+                "brics-odroid-007_cam0",
+                "brics-odroid-007_cam1",
+                "brics-odroid-008_cam0",
+                "brics-odroid-008_cam1",
+                "brics-odroid-009_cam0",
+                "brics-odroid-009_cam1",
+                "brics-odroid-010_cam0",
+                "brics-odroid-010_cam1"
+            ]
+        },
+        "1 0 0": {
+            "center": "brics-odroid-020_cam0",
+            "cameras": [
+                "brics-odroid-016_cam0",
+                "brics-odroid-017_cam0",
+                "brics-odroid-017_cam1",
+                "brics-odroid-018_cam0",
+                "brics-odroid-018_cam1",
+                "brics-odroid-019_cam0",
+                "brics-odroid-019_cam1",
+                "brics-odroid-020_cam0",
+                "brics-odroid-020_cam1"
+            ]
+        }
+    }
