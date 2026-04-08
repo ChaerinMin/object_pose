@@ -9,7 +9,7 @@ import math
 import numpy as np
 from PIL import Image
 from tqdm import tqdm
-from skimage import img_as_ubyte
+# from skimage import img_as_ubyte
 import imageio
 
 import torch

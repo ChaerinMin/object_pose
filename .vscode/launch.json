@@ -1,0 +1,18 @@
+{
+    "version": "2.0.0",
+    "configurations": [
+        {
+            "name": "Object Tracking Local",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "scripts.1_object_tracking_local",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "args":[
+                "--max-timestamp", "2",
+                "--iters", "120",
+                "--max-views", "16"
+            ]
+        }
+    ]
+}

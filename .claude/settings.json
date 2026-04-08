@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//oscar/data/ssrinath/users/cmin5/non-rigid-hoi/**)",
+      "Read(//oscar/data/ssrinath/users/cmin5/Depth-Anything-3/**)",
+      "Bash(python3 -c ':*)",
+      "Read(//oscar/data/ssrinath/public/brics-mini/2026-04-06/multisequence000001_safe/calib/**)",
+      "Read(//oscar/data/ssrinath/public/brics-mini/2026-04-06/multisequence000001_safe/calib/stage2/**)"
+    ]
+  }
+}

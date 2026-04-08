@@ -6,3 +6,6 @@ Grounded-SAM-2/
 lang-segment-anything/
 thirdparty/
 *.pt
+pytorch3d-0.7.8.tar.gz
+pytorch3d-0.7.8/
+__pycache__/
