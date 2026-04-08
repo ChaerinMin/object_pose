@@ -443,7 +443,8 @@ def optimize_pose_for_views(
     best_renders: List[np.ndarray] = []
     loss_history: List[float] = []
 
-    for it in range(args.iters):
+    pbar = tqdm(range(args.iters), desc="optim", leave=False, dynamic_ncols=True)
+    for it in pbar:
         optimizer.zero_grad()
         loss_pixels_list, image_list, _ = model(it)
         if not loss_pixels_list:
@@ -451,12 +452,13 @@ def optimize_pose_for_views(
         loss = torch.stack([loss.mean() for loss in loss_pixels_list]).mean()
         loss.backward()
         optimizer.step()
-        loss_history.append(float(loss.item()))
+        loss_val = float(loss.item())
+        loss_history.append(loss_val)
         with torch.no_grad():
             model.mesh_rotation.copy_(torch.nn.functional.normalize(model.mesh_rotation, dim=-1))
 
-        if loss.item() < best_loss and not check_for_nan_params(model):
-            best_loss = float(loss.item())
+        if loss_val < best_loss and not check_for_nan_params(model):
+            best_loss = loss_val
             quat = torch.nn.functional.normalize(model.mesh_rotation.detach(), dim=-1)
             rot = quaternion_to_matrix_wxyz(quat)[0].detach().cpu().numpy()
             trans = model.mesh_translation.detach()[0].cpu().numpy()
@@ -470,6 +472,9 @@ def optimize_pose_for_views(
                 # Render silhouette as black with alpha.
                 rgba[..., :3] = 0.0
                 best_renders.append(rgba)
+
+        scale_val = float(torch.exp(model.log_mesh_scale).detach().cpu().item())
+        pbar.set_postfix(loss=f"{loss_val:.5f}", best=f"{best_loss:.5f}", scale=f"{scale_val:.4f}")
 
     return best_pose, best_renders, best_loss, loss_history, best_scale
 
@@ -525,10 +530,11 @@ def write_video(path: Path, frames: Sequence[np.ndarray], fps: int = 10, frames_
         print(f"Video write failed via imageio: {exc}")
 
     # Final fallback: dump frames so nothing is lost.
+    # `frames` are BGR (frames_are_bgr=True), so pass directly to cv2.imwrite (no conversion needed).
     frame_dir = path.parent / (path.stem + "_frames")
     frame_dir.mkdir(parents=True, exist_ok=True)
     for idx, frame in enumerate(frames):
-        cv2.imwrite(str(frame_dir / f"{idx:06d}.png"), frame[:, :, ::-1])
+        cv2.imwrite(str(frame_dir / f"{idx:06d}.png"), frame)
     print(f"Wrote frames to {frame_dir} instead of video.")
 
 
@@ -599,7 +605,8 @@ def main() -> None:
     previous_pose: Optional[np.ndarray] = None
     previous_scale: Optional[float] = None
 
-    for idx, timestamp_name in enumerate(tqdm(timestamp_names, desc="Optimizing timestamps")):
+    ts_pbar = tqdm(timestamp_names, desc="timestamps", dynamic_ncols=True)
+    for idx, timestamp_name in enumerate(ts_pbar):
         frame_views = collect_frame_views(timestamp_name, args.parsed_root, args.mask_root, camera_infos, args)
         if not frame_views:
             tqdm.write(f"Skipping {timestamp_name}: no valid masked views.")
@@ -622,10 +629,12 @@ def main() -> None:
                 debug_projection(init_pose[:3, 3], camera_infos, args.mask_root, timestamp_name)
         else:
             init_pose = init_poses[idx]
+        ts_pbar.set_description(f"{timestamp_name} ({len(frame_views)} views)")
         pose, renders, loss, loss_history, scale = optimize_pose_for_views(
             mesh, frame_views, init_pose, args,
             init_scale=previous_scale,
         )
+        tqdm.write(f"[{timestamp_name}] loss={loss:.5f}  scale={scale:.4f}  t={pose[:3,3].round(3).tolist()}")
         previous_pose = pose
         previous_scale = scale
         solved_timestamp_names.append(timestamp_name)

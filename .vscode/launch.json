@@ -1,4 +1,5 @@
 {
+    //conda: zeronvs
     "version": "2.0.0",
     "configurations": [
         {
@@ -10,7 +11,7 @@
             "justMyCode": false,
             "args":[
                 "--max-timestamps", "2",
-                "--iters", "120",
+                "--iters", "5000",
                 "--max-views", "16",
                 "--depth-extr-inv",
                 "--debug-projection"
