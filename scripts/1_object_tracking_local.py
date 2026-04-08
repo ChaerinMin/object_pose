@@ -47,6 +47,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--use-depth-init", action="store_true", default=True, help="Initialize translation from DA3 depth (default).")
     parser.add_argument("--depth-root", type=Path, default=DEFAULT_DEPTH_ROOT)
     parser.add_argument("--depth-extr-inv", action="store_true", help="Invert DA3 extrinsics if they are cam_from_world.")
+    parser.add_argument("--debug-projection", action="store_true", help="Print projection diagnostics for depth init point vs mask centroid.")
     parser.add_argument("--depth-max-points", type=int, default=20000, help="Max depth points to sample for init.")
     parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT)
     parser.add_argument("--pose-key", type=str, default="global_poses")
@@ -58,6 +59,8 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--iters", type=int, default=120)
     parser.add_argument("--lr-rot", type=float, default=5e-3)
     parser.add_argument("--lr-trans", type=float, default=2e-4)
+    parser.add_argument("--lr-scale", type=float, default=5e-3)
+    parser.add_argument("--init-scale", type=float, default=1.0, help="Initial mesh scale (multiplicative). Adjust if COLMAP and mesh are in different units.")
     parser.add_argument("--min-mask-pixels", type=int, default=200)
     parser.add_argument("--max-views", type=int, default=16)
     parser.add_argument("--near", type=float, default=1e-3)
@@ -183,6 +186,46 @@ def depth_init_pose(
     pose = np.eye(4, dtype=np.float32)
     pose[:3, 3] = center.astype(np.float32)
     return pose
+
+
+def project_point_colmap(pt_world: np.ndarray, camera_info: Dict) -> Tuple[float, float]:
+    """Project a 3D world point to 2D pixel coords using COLMAP w2c convention.
+    Returns (u, v) in the camera's native (un-downsampled) resolution.
+    """
+    w2c = camera_info["w2c"].numpy()  # (4,4) LUF
+    # Undo the LUF flip to get back to COLMAP RDF for manual projection
+    flip = np.diag([-1., -1., 1.])
+    R_luf = w2c[:3, :3]   # flip @ R_colmap
+    t_luf = w2c[:3, 3]    # flip @ t_colmap
+    R_colmap = flip @ R_luf   # = flip^2 @ R_colmap = R_colmap
+    t_colmap = flip @ t_luf   # = t_colmap
+    p_cam = R_colmap @ pt_world + t_colmap
+    if p_cam[2] <= 0:
+        return float("nan"), float("nan")
+    u = camera_info["fx"] * p_cam[0] / p_cam[2] + camera_info["cx"]
+    v = camera_info["fy"] * p_cam[1] / p_cam[2] + camera_info["cy"]
+    return float(u), float(v)
+
+
+def debug_projection(pt_world: np.ndarray, camera_infos: List[Dict], mask_root: Path, timestamp_name: str) -> None:
+    """Print where pt_world projects to in each camera vs. the mask centroid.
+    If projection and mask centroid differ greatly, camera or init pose is wrong.
+    """
+    mask_dir = mask_root / timestamp_name / "object_masks"
+    print(f"\n[debug_projection] pt_world={pt_world.round(4)}")
+    for cam_info in camera_infos[:8]:  # check first 8 cameras
+        cam_name = cam_info["cam_name"]
+        u, v = project_point_colmap(pt_world, cam_info)
+        mask_path = mask_dir / f"{cam_name}.npz"
+        mask = load_mask(mask_path)
+        if mask is None:
+            continue
+        ys, xs = np.nonzero(mask)
+        if ys.size == 0:
+            continue
+        mu, mv = float(xs.mean()), float(ys.mean())
+        dist = np.hypot(u - mu, v - mv)
+        print(f"  {cam_name}: projected=({u:.1f},{v:.1f})  mask_centroid=({mu:.1f},{mv:.1f})  dist={dist:.1f}px")
 
 
 def read_rgb(image_path: Path) -> np.ndarray:
@@ -358,10 +401,13 @@ def optimize_pose_for_views(
     frame_views: Sequence[Dict],
     init_pose: np.ndarray,
     args: argparse.Namespace,
-) -> Tuple[np.ndarray, List[np.ndarray], float, List[float]]:
+    init_scale: Optional[float] = None,
+) -> Tuple[np.ndarray, List[np.ndarray], float, List[float], float]:
     device = mesh.device
     init_quat = quaternion_from_matrix(init_pose[:3, :3]).to(device)
     init_trans = torch.from_numpy(init_pose[:3, 3].astype(np.float32)).unsqueeze(0).to(device)
+    if init_scale is None:
+        init_scale = args.init_scale
 
     renderer_list = []
     image_ref_list = []
@@ -380,17 +426,20 @@ def optimize_pose_for_views(
         anchor_T=init_trans,
         init_R=init_quat,
         lambda_rgb=0.0,
+        init_scale=init_scale,
     ).to(device)
 
     optimizer = torch.optim.Adam(
         [
             {"params": [model.mesh_rotation], "lr": args.lr_rot},
             {"params": [model.mesh_translation], "lr": args.lr_trans},
+            {"params": [model.log_mesh_scale], "lr": args.lr_scale},
         ]
     )
 
     best_loss = float("inf")
     best_pose = init_pose.astype(np.float32).copy()
+    best_scale = init_scale
     best_renders: List[np.ndarray] = []
     loss_history: List[float] = []
 
@@ -411,6 +460,7 @@ def optimize_pose_for_views(
             quat = torch.nn.functional.normalize(model.mesh_rotation.detach(), dim=-1)
             rot = quaternion_to_matrix_wxyz(quat)[0].detach().cpu().numpy()
             trans = model.mesh_translation.detach()[0].cpu().numpy()
+            best_scale = float(torch.exp(model.log_mesh_scale).detach().cpu().item())
             best_pose = np.eye(4, dtype=np.float32)
             best_pose[:3, :3] = rot.astype(np.float32)
             best_pose[:3, 3] = trans.astype(np.float32)
@@ -421,7 +471,7 @@ def optimize_pose_for_views(
                 rgba[..., :3] = 0.0
                 best_renders.append(rgba)
 
-    return best_pose, best_renders, best_loss, loss_history
+    return best_pose, best_renders, best_loss, loss_history, best_scale
 
 
 def save_loss_plot(path: Path, losses: Sequence[float]) -> None:
@@ -482,15 +532,18 @@ def write_video(path: Path, frames: Sequence[np.ndarray], fps: int = 10, frames_
     print(f"Wrote frames to {frame_dir} instead of video.")
 
 
-def save_pose_json(path: Path, timestamp_names: Sequence[str], poses: Sequence[np.ndarray], losses: Sequence[float]) -> None:
+def save_pose_json(path: Path, timestamp_names: Sequence[str], poses: Sequence[np.ndarray], losses: Sequence[float], scales: Optional[Sequence[float]] = None) -> None:
     payload = {}
-    for timestamp_name, pose, loss in zip(timestamp_names, poses, losses):
-        payload[timestamp_name] = {
+    for i, (timestamp_name, pose, loss) in enumerate(zip(timestamp_names, poses, losses)):
+        entry = {
             "pose_matrix": pose.tolist(),
             "rotation_matrix": pose[:3, :3].tolist(),
             "translation": pose[:3, 3].tolist(),
             "loss": float(loss),
         }
+        if scales is not None:
+            entry["scale"] = float(scales[i])
+        payload[timestamp_name] = entry
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", encoding="utf-8") as handle:
         json.dump(payload, handle, indent=2)
@@ -541,8 +594,10 @@ def main() -> None:
     all_collages: List[np.ndarray] = []
     solved_poses: List[np.ndarray] = []
     solved_losses: List[float] = []
+    solved_scales: List[float] = []
     solved_timestamp_names: List[str] = []
     previous_pose: Optional[np.ndarray] = None
+    previous_scale: Optional[float] = None
 
     for idx, timestamp_name in enumerate(tqdm(timestamp_names, desc="Optimizing timestamps")):
         frame_views = collect_frame_views(timestamp_name, args.parsed_root, args.mask_root, camera_infos, args)
@@ -563,15 +618,20 @@ def main() -> None:
             )
             if init_pose is None:
                 init_pose = np.eye(4, dtype=np.float32)
+            if args.debug_projection and idx == 0:
+                debug_projection(init_pose[:3, 3], camera_infos, args.mask_root, timestamp_name)
         else:
             init_pose = init_poses[idx]
-        pose, renders, loss, loss_history = optimize_pose_for_views(
-            mesh, frame_views, init_pose, args
+        pose, renders, loss, loss_history, scale = optimize_pose_for_views(
+            mesh, frame_views, init_pose, args,
+            init_scale=previous_scale,
         )
         previous_pose = pose
+        previous_scale = scale
         solved_timestamp_names.append(timestamp_name)
         solved_poses.append(pose)
         solved_losses.append(loss)
+        solved_scales.append(scale)
         save_loss_plot(output_dirs["poses"] / "loss_plots" / f"{timestamp_name}.png", loss_history)
 
         tiles = []
@@ -585,7 +645,7 @@ def main() -> None:
                 cv2.imwrite(str(camera_dir / f"{view['cam_name']}.jpg"), tile)
 
         collage = make_collage(tiles)
-        cv2.putText(collage, f"{timestamp_name} loss={loss:.6f}", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 255), 2, cv2.LINE_AA)
+        cv2.putText(collage, f"{timestamp_name} loss={loss:.6f} scale={scale:.4f}", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 255), 2, cv2.LINE_AA)
         all_collages.append(collage)
         if args.save_per_timestamp:
             cv2.imwrite(str(output_dirs["collages"] / f"{timestamp_name}.jpg"), collage)
@@ -593,7 +653,7 @@ def main() -> None:
     if not solved_poses:
         raise RuntimeError("No timestamps were successfully optimized.")
 
-    save_pose_json(output_dirs["poses"] / "optimized_poses.json", solved_timestamp_names, solved_poses, solved_losses)
+    save_pose_json(output_dirs["poses"] / "optimized_poses.json", solved_timestamp_names, solved_poses, solved_losses, solved_scales)
     np.save(output_dirs["poses"] / "optimized_poses.npy", np.stack(solved_poses))
     write_video(output_dirs["videos"] / "multiview_pose_collage.mp4", all_collages, fps=10, frames_are_bgr=True)
 

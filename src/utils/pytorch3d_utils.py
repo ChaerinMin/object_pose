@@ -40,22 +40,21 @@ from pytorch3d.renderer import (
 from pytorch3d.transforms import Rotate, Translate, matrix_to_quaternion, quaternion_to_matrix, euler_angles_to_matrix, axis_angle_to_matrix
 
 def setup_renderer(args, camera, device, to_load_extr=True):
-    # Initialize a camera.
-    # print(camera)
     """
-    The camera coordinate sysmte in COLMAP is right-down-forward
-    Pytorch3D is left-up-forward
+    camera['w2c'] is already in PyTorch3D-compatible LUF convention,
+    as converted by load_camera_infos (COLMAP RDF → LUF via flip=diag([-1,-1,1])).
+    w2c_luf = [flip@R_colmap | flip@t_colmap], so:
+      p_cam_luf = (flip@R_colmap) @ p_world + flip@t_colmap = flip @ p_cam_colmap
+    which is exactly LUF (x=left, y=up, z=forward).
+    PyTorch3D's PerspectiveCameras expects row-vector convention: p_cam = p_world @ R_p3d + T_p3d,
+    so R_p3d = w2c_luf[:3,:3].T and T_p3d = w2c_luf[:3,3].
     """
     cam_name = camera['cam_name']
-    c2w = torch.inverse(camera['w2c']) # to c2w
-    R, T = c2w[:3, :3], c2w[:3, 3:]
-    R = torch.stack([-R[:, 0], -R[:, 1], R[:, 2]], 1) # from RDF to LUF for Rotation
-
-    new_c2w = torch.cat([R, T], 1)
-    w2c = torch.linalg.inv(torch.cat((new_c2w, torch.Tensor([[0,0,0,1]])), 0))
-    R, T = w2c[:3, :3].permute(1, 0), w2c[:3, 3] # convert R to row-major matrix
-    R = R[None] # batch 1 for rendering
-    T = T[None] # batch 1 for rendering
+    w2c = camera['w2c']  # already LUF from load_camera_infos
+    R = torch.tensor(w2c[:3, :3], dtype=torch.float32).permute(1, 0)  # transpose → row-major for PyTorch3D
+    T = torch.tensor(w2c[:3, 3], dtype=torch.float32)
+    R = R[None]  # batch dim
+    T = T[None]
     if not to_load_extr:
         R = torch.eye(3)[None]
         T = torch.zeros(3)[None]
@@ -284,18 +283,21 @@ def batch_render_ref_loader(args, idx, cameras, all_view_images, all_view_masks,
 def check_for_nan_params(model):
     has_nan_in_rotation = torch.isnan(model.mesh_rotation).any()
     has_nan_in_translation = torch.isnan(model.mesh_translation).any()
+    has_nan_in_scale = torch.isnan(model.log_mesh_scale).any()
 
     if has_nan_in_rotation:
         print("NaN values detected in model.mesh_rotation")
     if has_nan_in_translation:
         print("NaN values detected in model.mesh_translation")
+    if has_nan_in_scale:
+        print("NaN values detected in model.log_mesh_scale")
 
-    return has_nan_in_rotation or has_nan_in_translation
+    return has_nan_in_rotation or has_nan_in_translation or has_nan_in_scale
 
 
 # In[55]:
 class DRModel(nn.Module):
-    def __init__(self, meshes, renderer_list, image_ref_list, anchor_T=[[0.0, 0.0, 0.0]], init_R=torch.ones((1, 4), dtype=torch.float32), lambda_mask = 1.0, lambda_rgb = 0.0):
+    def __init__(self, meshes, renderer_list, image_ref_list, anchor_T=[[0.0, 0.0, 0.0]], init_R=torch.ones((1, 4), dtype=torch.float32), lambda_mask = 1.0, lambda_rgb = 0.0, init_scale=1.0):
         super().__init__()
         self.meshes = meshes
         self.device = meshes.device
@@ -303,12 +305,12 @@ class DRModel(nn.Module):
         self.lambda_mask = lambda_mask
         self.lambda_rgb = lambda_rgb
 
-        # Get the silhouette of the reference RGB image by finding all non-white pixel values. 
+        # Get the silhouette of the reference RGB image by finding all non-white pixel values.
         image_mask_ref_stack = torch.stack([torch.from_numpy((image_ref[:, :, 3] > 0).astype(np.float32)) for image_ref in image_ref_list])
         # image_mask_ref_stack = torch.stack([image_ref for image_ref in image_ref_list])
         self.register_buffer('image_mask_ref_stack', image_mask_ref_stack)
-        
-        # Get the colored reference RGB image by finding all non-white pixel values. 
+
+        # Get the colored reference RGB image by finding all non-white pixel values.
         if self.lambda_rgb > 0.0:
             image_rgb_ref_stack = torch.stack([
                 torch.from_numpy(
@@ -322,21 +324,24 @@ class DRModel(nn.Module):
             ])
             self.register_buffer('image_rgb_ref_stack', image_rgb_ref_stack)
 
-        # Create an optimizable parameter for the translation and rotation of the mesh. 
+        # Create an optimizable parameter for the translation and rotation of the mesh.
         self.mesh_rotation = nn.Parameter(init_R.to(dtype=torch.float32, device=meshes.device))
         self.mesh_translation = nn.Parameter(anchor_T.to(dtype=torch.float32, device=meshes.device)) if isinstance(anchor_T, torch.Tensor) else nn.Parameter(torch.tensor(anchor_T, dtype=torch.float32).to(meshes.device))
+        # log-scale so it stays positive and gradients are well-behaved
+        self.log_mesh_scale = nn.Parameter(torch.tensor([[math.log(init_scale)]], dtype=torch.float32, device=meshes.device))
 
     def forward(self, it):
-        
-        # Render the image using the updated camera position. Based on the new position of the 
+
+        # Render the image using the updated camera position. Based on the new position of the
         # camera we calculate the rotation and translation matrices
         # R = Rotate(euler_angles_to_matrix(self.mesh_rotation, convention='XYZ'))
         # quaternions = torch.nn.functional.normalize(self.mesh_rotation, dim=-1)
         R = Rotate(quaternion_to_matrix(self.mesh_rotation), orthogonal_tol=1e-3)
-        T = Translate(torch.clamp(self.mesh_translation, min=-0.2, max=1.2))   # (1, 3)
+        T = Translate(self.mesh_translation)   # (1, 3)
         transform  = R.compose(T)
         # print('transform nan', torch.isnan(transform).any())
-        tverts = transform.transform_points(self.meshes.verts_list()[0])
+        scale = torch.exp(self.log_mesh_scale)  # always positive
+        tverts = transform.transform_points(self.meshes.verts_list()[0] * scale)
         faces = self.meshes.faces_list()[0]
         tmesh = Meshes(
             verts=[tverts],   

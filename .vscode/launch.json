@@ -9,9 +9,11 @@
             "console": "integratedTerminal",
             "justMyCode": false,
             "args":[
-                "--max-timestamp", "2",
+                "--max-timestamps", "2",
                 "--iters", "120",
-                "--max-views", "16"
+                "--max-views", "16",
+                "--depth-extr-inv",
+                "--debug-projection"
             ]
         }
     ]
