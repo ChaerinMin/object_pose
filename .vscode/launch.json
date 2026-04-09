@@ -10,8 +10,10 @@
             "console": "integratedTerminal",
             "justMyCode": false,
             "args":[
-                "--max-timestamps", "2",
-                "--iters", "5000",
+                "--max-timestamps", "-1",
+                "--iters", "3000",
+                "--iters-rest", "50",
+                "--resume-from-json", "/oscar/data/ssrinath/users/cmin5/object_pose/outputs/multiview_object_pose_nvdiffrast/poses/optimized_poses.json",
                 "--max-views", "16",
                 "--depth-extr-inv",
                 "--debug-projection"

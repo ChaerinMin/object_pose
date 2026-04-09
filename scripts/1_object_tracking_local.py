@@ -56,7 +56,9 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--timestamp-step", type=int, default=1)
     parser.add_argument("--max-timestamps", type=int, default=-1)
     parser.add_argument("--down", type=float, default=2.0)
-    parser.add_argument("--iters", type=int, default=120)
+    parser.add_argument("--iters", type=int, default=3000, help="Iterations for the first unloaded frame.")
+    parser.add_argument("--iters-rest", type=int, default=200, help="Iterations for subsequent frames after the first.")
+    parser.add_argument("--resume-from-json", type=Path, default=None, help="Path to existing optimized_poses.json. Frames already in this file are loaded directly, skipping optimization.")
     parser.add_argument("--lr-rot", type=float, default=5e-3)
     parser.add_argument("--lr-trans", type=float, default=2e-4)
     parser.add_argument("--lr-scale", type=float, default=5e-3)
@@ -402,6 +404,7 @@ def optimize_pose_for_views(
     init_pose: np.ndarray,
     args: argparse.Namespace,
     init_scale: Optional[float] = None,
+    iters: Optional[int] = None,
 ) -> Tuple[np.ndarray, List[np.ndarray], float, List[float], float]:
     device = mesh.device
     init_quat = quaternion_from_matrix(init_pose[:3, :3]).to(device)
@@ -443,7 +446,8 @@ def optimize_pose_for_views(
     best_renders: List[np.ndarray] = []
     loss_history: List[float] = []
 
-    pbar = tqdm(range(args.iters), desc="optim", leave=False, dynamic_ncols=True)
+    num_iters = iters if iters is not None else args.iters
+    pbar = tqdm(range(num_iters), desc="optim", leave=False, dynamic_ncols=True)
     for it in pbar:
         optimizer.zero_grad()
         loss_pixels_list, image_list, _ = model(it)
@@ -597,6 +601,16 @@ def main() -> None:
     mesh = load_mesh(args.mesh_path, args.device, args.mesh_scale)
     output_dirs = ensure_output_dirs(args.output_root)
 
+    # Load existing poses to resume from if requested.
+    resume_poses: Dict = {}
+    if args.resume_from_json is not None:
+        if args.resume_from_json.exists():
+            with open(args.resume_from_json, "r", encoding="utf-8") as _f:
+                resume_poses = json.load(_f)
+            print(f"Loaded {len(resume_poses)} poses from {args.resume_from_json}")
+        else:
+            print(f"Warning: --resume-from-json path does not exist: {args.resume_from_json}")
+
     all_collages: List[np.ndarray] = []
     solved_poses: List[np.ndarray] = []
     solved_losses: List[float] = []
@@ -604,13 +618,36 @@ def main() -> None:
     solved_timestamp_names: List[str] = []
     previous_pose: Optional[np.ndarray] = None
     previous_scale: Optional[float] = None
+    first_unloaded_frame = len(resume_poses) == 0  # False if any frames were already loaded from JSON.
 
     ts_pbar = tqdm(timestamp_names, desc="timestamps", dynamic_ncols=True)
     for idx, timestamp_name in enumerate(ts_pbar):
+        # If this timestamp already has a saved result, load it directly.
+        if timestamp_name in resume_poses:
+            entry = resume_poses[timestamp_name]
+            pose = np.array(entry["pose_matrix"], dtype=np.float32)
+            loss = float(entry["loss"])
+            scale = float(entry.get("scale", args.init_scale))
+            previous_pose = pose
+            previous_scale = scale
+            solved_timestamp_names.append(timestamp_name)
+            solved_poses.append(pose)
+            solved_losses.append(loss)
+            solved_scales.append(scale)
+            tqdm.write(f"[{timestamp_name}] Loaded from JSON: loss={loss:.5f}  scale={scale:.4f}  t={pose[:3,3].round(3).tolist()}")
+            continue
+
         frame_views = collect_frame_views(timestamp_name, args.parsed_root, args.mask_root, camera_infos, args)
         if not frame_views:
             tqdm.write(f"Skipping {timestamp_name}: no valid masked views.")
             continue
+
+        # Determine iteration count: first unloaded frame uses args.iters, rest use args.iters_rest.
+        if first_unloaded_frame:
+            frame_iters = args.iters
+            first_unloaded_frame = False
+        else:
+            frame_iters = args.iters_rest
 
         if previous_pose is not None:
             init_pose = previous_pose
@@ -633,6 +670,7 @@ def main() -> None:
         pose, renders, loss, loss_history, scale = optimize_pose_for_views(
             mesh, frame_views, init_pose, args,
             init_scale=previous_scale,
+            iters=frame_iters,
         )
         tqdm.write(f"[{timestamp_name}] loss={loss:.5f}  scale={scale:.4f}  t={pose[:3,3].round(3).tolist()}")
         previous_pose = pose
@@ -656,8 +694,8 @@ def main() -> None:
         collage = make_collage(tiles)
         cv2.putText(collage, f"{timestamp_name} loss={loss:.6f} scale={scale:.4f}", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 255), 2, cv2.LINE_AA)
         all_collages.append(collage)
-        if args.save_per_timestamp:
-            cv2.imwrite(str(output_dirs["collages"] / f"{timestamp_name}.jpg"), collage)
+        cv2.imwrite(str(output_dirs["collages"] / f"{timestamp_name}.jpg"), collage)
+        save_pose_json(output_dirs["poses"] / "optimized_poses.json", solved_timestamp_names, solved_poses, solved_losses, solved_scales)
 
     if not solved_poses:
         raise RuntimeError("No timestamps were successfully optimized.")
