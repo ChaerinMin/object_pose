@@ -34,6 +34,7 @@ DEFAULT_CALIB_ROOT = Path("/oscar/data/ssrinath/public/brics-mini/2026-04-06/mul
 DEFAULT_TRAJ_PATH = Path("/oscar/data/ssrinath/public/brics-mini-copy/obj_traj/object_poses_icp_trackscaled_0142.npz")
 DEFAULT_DEPTH_ROOT = Path("/oscar/data/ssrinath/public/brics-mini/2026-04-06/multisequence000001_safe/outputs/da3")
 DEFAULT_OUTPUT_ROOT = PROJECT_ROOT / "outputs" / "multiview_object_pose_nvdiffrast"
+DEFAULT_TRACKING_NPZ = Path("/oscar/data/ssrinath/public/brics-mini/2026-04-06/multisequence000001_safe/outputs/tracking/result.npz")
 
 
 def build_argparser() -> argparse.ArgumentParser:
@@ -76,6 +77,18 @@ def build_argparser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--save-per-timestamp", action="store_true")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    # Resume from a specific timestamp (skip all earlier ones).
+    parser.add_argument("--resume-from-timestamp", type=str, default=None,
+        help="Timestamp name (e.g. 'timestamp_0142') to resume from. All earlier timestamps are skipped.")
+    # Adaptive iteration count based on 4D tracking motion magnitude.
+    parser.add_argument("--tracking-npz", type=Path, default=DEFAULT_TRACKING_NPZ,
+        help="Path to 4D tracking result.npz used to estimate per-frame motion and set adaptive iters.")
+    parser.add_argument("--iters-adaptive-max", type=int, default=1000,
+        help="Max iterations used when motion is at or above --motion-hi (default 1000).")
+    parser.add_argument("--motion-lo", type=float, default=0.005,
+        help="Motion magnitude (m) below which --iters-rest is used (default 0.005).")
+    parser.add_argument("--motion-hi", type=float, default=0.05,
+        help="Motion magnitude (m) above which --iters-adaptive-max is used (default 0.05).")
     return parser
 
 
@@ -483,6 +496,44 @@ def optimize_pose_for_views(
     return best_pose, best_renders, best_loss, loss_history, best_scale
 
 
+def load_tracking_data(path: Path) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+    """Load 4D tracking NPZ. Returns (tracks, vis) where tracks is (T, N, 3) and vis is (T, N)."""
+    if not path.exists():
+        print(f"Warning: tracking NPZ not found at {path}. Adaptive iters disabled.")
+        return None
+    data = np.load(path, allow_pickle=True)
+    tracks = data["pred_tracks"][0]  # (T, N, 3)
+    vis = data["pred_vis"][0]        # (T, N)
+    return tracks, vis
+
+
+def compute_motion_magnitude(tracks: np.ndarray, vis: np.ndarray, track_t: int) -> float:
+    """Mean 3D displacement of mutually visible points from frame track_t-1 to track_t."""
+    if track_t <= 0 or track_t >= tracks.shape[0]:
+        return 0.0
+    visible_both = vis[track_t] & vis[track_t - 1]
+    if visible_both.sum() < 1:
+        return 0.0
+    disp = tracks[track_t, visible_both] - tracks[track_t - 1, visible_both]
+    return float(np.linalg.norm(disp, axis=-1).mean())
+
+
+def adaptive_iters_from_motion(
+    motion: float,
+    iters_min: int,
+    iters_max: int,
+    motion_lo: float,
+    motion_hi: float,
+) -> int:
+    """Linearly interpolate iteration count between iters_min and iters_max based on motion."""
+    if motion <= motion_lo:
+        return iters_min
+    if motion >= motion_hi:
+        return iters_max
+    t = (motion - motion_lo) / (motion_hi - motion_lo)
+    return int(iters_min + t * (iters_max - iters_min))
+
+
 def save_loss_plot(path: Path, losses: Sequence[float]) -> None:
     if not losses:
         return
@@ -611,6 +662,13 @@ def main() -> None:
         else:
             print(f"Warning: --resume-from-json path does not exist: {args.resume_from_json}")
 
+    # Load 4D tracking data for adaptive iteration count.
+    tracking_data: Optional[Tuple[np.ndarray, np.ndarray]] = None
+    if args.tracking_npz is not None:
+        tracking_data = load_tracking_data(args.tracking_npz)
+        if tracking_data is not None:
+            print(f"Loaded tracking data: {tracking_data[0].shape[0]} timestamps, {tracking_data[0].shape[1]} points.")
+
     all_collages: List[np.ndarray] = []
     solved_poses: List[np.ndarray] = []
     solved_losses: List[float] = []
@@ -619,6 +677,35 @@ def main() -> None:
     previous_pose: Optional[np.ndarray] = None
     previous_scale: Optional[float] = None
     first_unloaded_frame = len(resume_poses) == 0  # False if any frames were already loaded from JSON.
+
+    # Skip timestamps before the specified resume point and seed previous_pose from JSON.
+    if args.resume_from_timestamp is not None:
+        # Accept both zero-padded (timestamp_0240) and unpadded (timestamp_240) forms.
+        resume_ts = args.resume_from_timestamp
+        if resume_ts not in timestamp_names:
+            try:
+                resume_num = int(resume_ts.split("_")[-1])
+                resume_ts = next(ts for ts in timestamp_names if int(ts.split("_")[-1]) == resume_num)
+            except StopIteration:
+                raise RuntimeError(
+                    f"--resume-from-timestamp '{args.resume_from_timestamp}' not found. "
+                    f"Available range: {timestamp_names[0]} – {timestamp_names[-1]}"
+                )
+        start_idx = timestamp_names.index(resume_ts)
+        skipped_names = timestamp_names[:start_idx]
+        timestamp_names = timestamp_names[start_idx:]
+        first_unloaded_frame = True  # Treat resume point as a fresh start.
+        # Initialize previous_pose from the last available pre-resume entry in JSON.
+        for ts in reversed(skipped_names):
+            if ts in resume_poses:
+                entry = resume_poses[ts]
+                previous_pose = np.array(entry["pose_matrix"], dtype=np.float32)
+                previous_scale = float(entry.get("scale", args.init_scale))
+                print(f"[resume] Initialized pose from '{ts}' (last pre-resume timestamp in JSON).")
+                break
+        print(f"[resume] Starting from '{args.resume_from_timestamp}' (skipped {start_idx} timestamps).")
+        # Clear resume_poses so timestamps from the resume point onward are re-optimized, not loaded from JSON.
+        resume_poses = {}
 
     ts_pbar = tqdm(timestamp_names, desc="timestamps", dynamic_ncols=True)
     for idx, timestamp_name in enumerate(ts_pbar):
@@ -642,8 +729,19 @@ def main() -> None:
             tqdm.write(f"Skipping {timestamp_name}: no valid masked views.")
             continue
 
-        # Determine iteration count: first unloaded frame uses args.iters, rest use args.iters_rest.
-        if first_unloaded_frame:
+        # Determine iteration count.
+        # If tracking data is available, always use adaptive iters (including the first unloaded frame).
+        # Otherwise, first unloaded frame uses args.iters and the rest use args.iters_rest.
+        if tracking_data is not None:
+            ts_num = int(timestamp_name.split("_")[-1])
+            track_t = min(ts_num, tracking_data[0].shape[0] - 1)
+            motion = compute_motion_magnitude(tracking_data[0], tracking_data[1], track_t)
+            frame_iters = adaptive_iters_from_motion(
+                motion, args.iters_rest, args.iters_adaptive_max, args.motion_lo, args.motion_hi
+            )
+            tqdm.write(f"[{timestamp_name}] motion={motion:.5f}m  iters={frame_iters}")
+            first_unloaded_frame = False
+        elif first_unloaded_frame:
             frame_iters = args.iters
             first_unloaded_frame = False
         else:
