@@ -10,18 +10,46 @@
             "console": "integratedTerminal",
             "justMyCode": false,
             "args":[
-                "--max-timestamps", "-1",
+                "--seq_root", "/oscar/data/ssrinath/public/brics-mini/2026-04-06/multisequence000001_safe",
+                "--mesh-path", "/oscar/data/ssrinath/public/brics-mini-copy/obj_assets/3_30_2026.obj",
+                "--timestamp-start", "0",
+                "--timestamp-end", "-1",
+                "--timestamp-step", "1",
                 "--iters", "3000",
                 "--iters-rest", "50",
-                "--resume-from-json", "/oscar/data/ssrinath/users/cmin5/object_pose/outputs/multiview_object_pose_nvdiffrast/poses/optimized_poses.json",
-                "--resume-from-timestamp", "timestamp_250",
-                "--tracking-npz", "/oscar/data/ssrinath/public/brics-mini/2026-04-06/multisequence000001_safe/outputs/tracking/result.npz",
+                // "--resume-from-timestamp", "timestamp_250",
                 "--iters-adaptive-max", "1000",
                 "--motion-lo", "0.005",
                 "--motion-hi", "0.05",
+                "--depth-extr-inv",
+            ]
+        },
+        {
+            "name": "Object Tracking ICP Init",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "scripts.2_object_tracking_icp_init",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "args":[
+                "--output-root", "/oscar/data/ssrinath/users/cmin5/object_pose/output_sample2_30iters",
+                "--timestamp-start", "260",
+                "--timestamp-end", "-1",
+                "--timestamp-step", "2",
+                "--max-timestamps", "-1",
+                "--iters", "3000",
+                "--iters-rest", "30",
+                "--resume-from-json", "/oscar/data/ssrinath/users/cmin5/object_pose/outputs_safe/multiview_object_pose_nvdiffrast/poses/optimized_poses.json",
+                "--resume-from-timestamp", "timestamp_260",
+                "--tracking-npz", "/oscar/data/ssrinath/public/brics-mini/2026-04-06/multisequence000001_safe/outputs/tracking/result.npz",
+                "--no-adaptive-iters",
+                "--iters-adaptive-max", "500",
+                "--motion-lo", "0.10",
+                "--motion-hi", "0.12",
                 "--max-views", "16",
                 "--depth-extr-inv",
-                "--debug-projection"
+                "--debug-projection",
+                "--icp-npz", "/oscar/data/ssrinath/users/cmin5/object_pose/cylinder_poses_kabsch_trackscaled_1.0.npz"
             ]
         }
     ]

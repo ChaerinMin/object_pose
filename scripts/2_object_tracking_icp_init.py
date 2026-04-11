@@ -1,3 +1,17 @@
+"""Object pose tracking with ICP-based frame-to-frame initialization.
+
+Identical to 1_object_tracking_local.py except that for frame t (t > first frame),
+the initial pose is computed as:
+
+    init_pose_t = compose(icp_relative_poses[prev_ts_num : ts_num]) @ previous_pose
+
+where compose(rels[i:j]) = rel[j-1] @ ... @ rel[i] and
+rel[k] satisfies: global_pose[k+1] = rel[k] @ global_pose[k].
+
+If the ICP npz is not provided, or the indices are out of range, falls back to
+the previous frame's pose (same behaviour as the original script).
+"""
+
 import argparse
 import json
 import math
@@ -27,31 +41,31 @@ from src.utils.pytorch3d_utils import setup_renderer, DRModel, check_for_nan_par
 from pytorch3d.io import load_objs_as_meshes
 
 
-SEQ_MASK_SUBPATH = "outputs/sam3"
-SEQ_PARSED_SUBPATH = "parsed"
-SEQ_CALIB_SUBPATH = "calib"
-SEQ_DEPTH_SUBPATH = "outputs/da3"
-SEQ_TRACKING_SUBPATH = "outputs/tracking/result.npz"
-SEQ_OUTPUT_SUBPATH = "outputs/object_pose"
-POSES_JSON_SUBPATH = "poses/optimized_poses.json"
+DEFAULT_MESH_PATH = Path("/oscar/data/ssrinath/public/brics-mini-copy/obj_assets/3_30_2026.obj")
+DEFAULT_MASK_ROOT = Path("/oscar/data/ssrinath/public/brics-mini/2026-04-06/multisequence000001_safe/outputs/sam3")
+DEFAULT_PARSED_ROOT = Path("/oscar/data/ssrinath/public/brics-mini/2026-04-06/multisequence000001_safe/parsed")
+DEFAULT_CALIB_ROOT = Path("/oscar/data/ssrinath/public/brics-mini/2026-04-06/multisequence000001_safe/calib")
+DEFAULT_TRAJ_PATH = Path("/oscar/data/ssrinath/public/brics-mini-copy/obj_traj/object_poses_icp_trackscaled_0142.npz")
+DEFAULT_DEPTH_ROOT = Path("/oscar/data/ssrinath/public/brics-mini/2026-04-06/multisequence000001_safe/outputs/da3")
+DEFAULT_OUTPUT_ROOT = PROJECT_ROOT / "outputs_safe" / "multiview_object_pose_icp_init"
+DEFAULT_TRACKING_NPZ = Path("/oscar/data/ssrinath/public/brics-mini/2026-04-06/multisequence000001_safe/outputs/tracking/result.npz")
+DEFAULT_ICP_NPZ = Path("/oscar/data/ssrinath/users/cmin5/object_pose/cylinder_poses_kabsch_trackscaled_1.0.npz")
 
 
 def build_argparser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Multiview object pose fitting with PyTorch3D.")
-    parser.add_argument("--seq-root", type=Path, required=True,
-        help="Root directory of the sequence (e.g. .../multisequence000001_safe/). "
-             "Sub-paths for masks, parsed, calib, depth, tracking, and output are derived from this.")
-    parser.add_argument("--mesh-path", type=Path, required=True,
-        help="Path to the .obj mesh file.")
-    parser.add_argument("--traj-path", type=Path, default=None,
-        help="Path to trajectory .npz used for --use-traj-init.")
+    parser = argparse.ArgumentParser(description="Multiview object pose fitting with ICP-based initialization.")
+    parser.add_argument("--mesh-path", type=Path, default=DEFAULT_MESH_PATH)
+    parser.add_argument("--mask-root", type=Path, default=DEFAULT_MASK_ROOT)
+    parser.add_argument("--parsed-root", type=Path, default=DEFAULT_PARSED_ROOT)
+    parser.add_argument("--calib-root", type=Path, default=DEFAULT_CALIB_ROOT)
+    parser.add_argument("--traj-path", type=Path, default=DEFAULT_TRAJ_PATH)
     parser.add_argument("--use-traj-init", action="store_true", help="Use trajectory npz for initialization instead of depth.")
     parser.add_argument("--use-depth-init", action="store_true", default=True, help="Initialize translation from DA3 depth (default).")
+    parser.add_argument("--depth-root", type=Path, default=DEFAULT_DEPTH_ROOT)
     parser.add_argument("--depth-extr-inv", action="store_true", help="Invert DA3 extrinsics if they are cam_from_world.")
     parser.add_argument("--debug-projection", action="store_true", help="Print projection diagnostics for depth init point vs mask centroid.")
     parser.add_argument("--depth-max-points", type=int, default=20000, help="Max depth points to sample for init.")
-    parser.add_argument("--output-root", type=Path, default=None,
-        help="Output directory (default: <seq-root>/outputs/object_pose).")
+    parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT)
     parser.add_argument("--pose-key", type=str, default="global_poses")
     parser.add_argument("--timestamp-start", type=int, default=0)
     parser.add_argument("--timestamp-end", type=int, default=-1)
@@ -60,6 +74,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--down", type=float, default=2.0)
     parser.add_argument("--iters", type=int, default=3000, help="Iterations for the first unloaded frame.")
     parser.add_argument("--iters-rest", type=int, default=200, help="Iterations for subsequent frames after the first.")
+    parser.add_argument("--resume-from-json", type=Path, default=None, help="Path to existing optimized_poses.json. Frames already in this file are loaded directly, skipping optimization.")
     parser.add_argument("--lr-rot", type=float, default=5e-3)
     parser.add_argument("--lr-trans", type=float, default=2e-4)
     parser.add_argument("--lr-scale", type=float, default=5e-3)
@@ -77,16 +92,24 @@ def build_argparser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--save-per-timestamp", action="store_true")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
-    # Resume from a specific timestamp (skip all earlier ones).
     parser.add_argument("--resume-from-timestamp", type=str, default=None,
         help="Timestamp name (e.g. 'timestamp_0142') to resume from. All earlier timestamps are skipped.")
-    # Adaptive iteration count based on 4D tracking motion magnitude.
+    parser.add_argument("--tracking-npz", type=Path, default=DEFAULT_TRACKING_NPZ,
+        help="Path to 4D tracking result.npz used to estimate per-frame motion and set adaptive iters.")
+    parser.add_argument("--no-adaptive-iters", action="store_true",
+        help="Disable adaptive iteration count (always use --iters for first frame, --iters-rest for the rest).")
     parser.add_argument("--iters-adaptive-max", type=int, default=1000,
         help="Max iterations used when motion is at or above --motion-hi (default 1000).")
     parser.add_argument("--motion-lo", type=float, default=0.005,
         help="Motion magnitude (m) below which --iters-rest is used (default 0.005).")
     parser.add_argument("--motion-hi", type=float, default=0.05,
         help="Motion magnitude (m) above which --iters-adaptive-max is used (default 0.05).")
+    # ICP initialization arguments
+    parser.add_argument("--icp-npz", type=Path, default=DEFAULT_ICP_NPZ,
+        help="Path to ICP result npz containing relative poses for frame-to-frame initialization.")
+    parser.add_argument("--icp-pose-key", type=str, default="relative_poses",
+        help="Key in the ICP npz for frame-to-frame relative poses (shape: N-1, 4, 4). "
+             "Convention: rel[i] @ global[i] = global[i+1].")
     return parser
 
 
@@ -163,7 +186,6 @@ def depth_init_pose(
         depth_h, depth_w = depth[idx].shape
         cam_info = cam_info_map.get(cam_name)
         if cam_info is not None:
-            # Scale calibrated intrinsics to depth resolution.
             scale_x = depth_w / max(cam_info["W"], 1)
             scale_y = depth_h / max(cam_info["H"], 1)
             fx = float(cam_info["fx"]) * scale_x
@@ -202,16 +224,12 @@ def depth_init_pose(
 
 
 def project_point_colmap(pt_world: np.ndarray, camera_info: Dict) -> Tuple[float, float]:
-    """Project a 3D world point to 2D pixel coords using COLMAP w2c convention.
-    Returns (u, v) in the camera's native (un-downsampled) resolution.
-    """
-    w2c = camera_info["w2c"].numpy()  # (4,4) LUF
-    # Undo the LUF flip to get back to COLMAP RDF for manual projection
+    w2c = camera_info["w2c"].numpy()
     flip = np.diag([-1., -1., 1.])
-    R_luf = w2c[:3, :3]   # flip @ R_colmap
-    t_luf = w2c[:3, 3]    # flip @ t_colmap
-    R_colmap = flip @ R_luf   # = flip^2 @ R_colmap = R_colmap
-    t_colmap = flip @ t_luf   # = t_colmap
+    R_luf = w2c[:3, :3]
+    t_luf = w2c[:3, 3]
+    R_colmap = flip @ R_luf
+    t_colmap = flip @ t_luf
     p_cam = R_colmap @ pt_world + t_colmap
     if p_cam[2] <= 0:
         return float("nan"), float("nan")
@@ -221,12 +239,9 @@ def project_point_colmap(pt_world: np.ndarray, camera_info: Dict) -> Tuple[float
 
 
 def debug_projection(pt_world: np.ndarray, camera_infos: List[Dict], mask_root: Path, timestamp_name: str) -> None:
-    """Print where pt_world projects to in each camera vs. the mask centroid.
-    If projection and mask centroid differ greatly, camera or init pose is wrong.
-    """
     mask_dir = mask_root / timestamp_name / "object_masks"
     print(f"\n[debug_projection] pt_world={pt_world.round(4)}")
-    for cam_info in camera_infos[:8]:  # check first 8 cameras
+    for cam_info in camera_infos[:8]:
         cam_name = cam_info["cam_name"]
         u, v = project_point_colmap(pt_world, cam_info)
         mask_path = mask_dir / f"{cam_name}.npz"
@@ -328,7 +343,6 @@ def load_camera_infos(calib_root: Path) -> List[Dict]:
         camera = cameras[image.camera_id]
         params = camera.params
         fx, fy, cx, cy = map(float, params[:4])
-        # Original implementation: COLMAP RDF -> LUF (matches PyTorch3D helper).
         w2c_rdf = np.eye(4, dtype=np.float32)
         w2c_rdf[:3, :3] = colmap_utils.qvec2rotmat(image.qvec).astype(np.float32)
         w2c_rdf[:3, 3] = np.asarray(image.tvec, dtype=np.float32)
@@ -484,7 +498,6 @@ def optimize_pose_for_views(
             best_renders = []
             for img in image_list:
                 rgba = img.detach().squeeze(0).cpu().numpy()
-                # Render silhouette as black with alpha.
                 rgba[..., :3] = 0.0
                 best_renders.append(rgba)
 
@@ -534,6 +547,50 @@ def adaptive_iters_from_motion(
     return int(iters_min + t * (iters_max - iters_min))
 
 
+def load_icp_relative_poses(path: Path, key: str) -> Optional[np.ndarray]:
+    """Load ICP relative poses from npz. Returns (N-1, 4, 4) array or None."""
+    if not path.exists():
+        print(f"Warning: ICP npz not found at {path}. ICP-based init disabled.")
+        return None
+    data = np.load(path, allow_pickle=True)
+    if key not in data.files:
+        print(f"Warning: key '{key}' not in {path}. Available: {data.files}. ICP-based init disabled.")
+        return None
+    rel = data[key].astype(np.float32)
+    print(f"Loaded ICP relative poses: shape={rel.shape} from {path}")
+    return rel
+
+
+def compose_relative_poses(icp_rel: np.ndarray, from_ts: int, to_ts: int) -> Optional[np.ndarray]:
+    """Compose ICP relative poses from frame `from_ts` to frame `to_ts`.
+
+    Convention: icp_rel[i] @ global[i] = global[i+1]
+    So to go from frame A to frame B (B > A):
+        composed = icp_rel[B-1] @ icp_rel[B-2] @ ... @ icp_rel[A]
+
+    We build this left-to-right:
+        start with I, then for i = A, A+1, ..., B-1:
+            composed = icp_rel[i] @ composed
+        → final composed = icp_rel[B-1] @ ... @ icp_rel[A]  ✓
+
+    Returns a (4, 4) SE(3) matrix, or None if indices are out of range.
+    """
+    if from_ts >= to_ts:
+        return None
+    n_rels = icp_rel.shape[0]
+    # We need indices from_ts, from_ts+1, ..., to_ts-1
+    lo = from_ts
+    hi = to_ts - 1  # inclusive
+    if lo < 0 or hi >= n_rels:
+        return None
+    composed = np.eye(4, dtype=np.float32)
+    # Forward loop: composed = rel[hi] @ ... @ rel[lo]
+    # Each step: composed = rel[i] @ composed  (prepend rel[i] on the left)
+    for i in range(lo, hi + 1):
+        composed = icp_rel[i] @ composed
+    return composed
+
+
 def save_loss_plot(path: Path, losses: Sequence[float]) -> None:
     if not losses:
         return
@@ -569,7 +626,6 @@ def write_video(path: Path, frames: Sequence[np.ndarray], fps: int = 10, frames_
             out = frame[:, :, ::-1]
         prepared.append(np.ascontiguousarray(out.astype(np.uint8)))
 
-    # Prefer imageio/ffmpeg with yuv420p for broad compatibility.
     try:
         with imageio.get_writer(
             str(path),
@@ -584,8 +640,6 @@ def write_video(path: Path, frames: Sequence[np.ndarray], fps: int = 10, frames_
     except Exception as exc:
         print(f"Video write failed via imageio: {exc}")
 
-    # Final fallback: dump frames so nothing is lost.
-    # `frames` are BGR (frames_are_bgr=True), so pass directly to cv2.imwrite (no conversion needed).
     frame_dir = path.parent / (path.stem + "_frames")
     frame_dir.mkdir(parents=True, exist_ok=True)
     for idx, frame in enumerate(frames):
@@ -625,25 +679,6 @@ def ensure_output_dirs(output_root: Path) -> Dict[str, Path]:
 
 def main() -> None:
     args = build_argparser().parse_args()
-
-    # Derive per-sequence paths from --seq-root.
-    seq_root = args.seq_root
-    args.mask_root = seq_root / SEQ_MASK_SUBPATH
-    args.parsed_root = seq_root / SEQ_PARSED_SUBPATH
-    args.calib_root = seq_root / SEQ_CALIB_SUBPATH
-    args.depth_root = seq_root / SEQ_DEPTH_SUBPATH
-    args.tracking_npz = seq_root / SEQ_TRACKING_SUBPATH
-    if args.output_root is None:
-        args.output_root = seq_root / SEQ_OUTPUT_SUBPATH
-
-    # Auto-detect resume JSON from output directory when --resume-from-timestamp is given.
-    args.resume_from_json = None
-    if args.resume_from_timestamp is not None:
-        args.resume_from_json = args.output_root / POSES_JSON_SUBPATH
-
-    if args.use_traj_init and args.traj_path is None:
-        raise RuntimeError("--traj-path is required when --use-traj-init is set.")
-
     if args.device.startswith("cuda") and not torch.cuda.is_available():
         raise RuntimeError("CUDA was requested but is not available.")
 
@@ -668,6 +703,11 @@ def main() -> None:
             raise KeyError(f"{args.pose_key} not found in {args.traj_path}. Available keys: {pose_data.files}")
         init_poses = resample_poses(pose_data[args.pose_key], len(timestamp_names))
 
+    # Load ICP relative poses for frame-to-frame initialization.
+    icp_rel: Optional[np.ndarray] = None
+    if args.icp_npz is not None:
+        icp_rel = load_icp_relative_poses(args.icp_npz, args.icp_pose_key)
+
     mesh = load_mesh(args.mesh_path, args.device, args.mesh_scale)
     output_dirs = ensure_output_dirs(args.output_root)
 
@@ -683,7 +723,7 @@ def main() -> None:
 
     # Load 4D tracking data for adaptive iteration count.
     tracking_data: Optional[Tuple[np.ndarray, np.ndarray]] = None
-    if args.tracking_npz is not None:
+    if not args.no_adaptive_iters and args.tracking_npz is not None:
         tracking_data = load_tracking_data(args.tracking_npz)
         if tracking_data is not None:
             print(f"Loaded tracking data: {tracking_data[0].shape[0]} timestamps, {tracking_data[0].shape[1]} points.")
@@ -696,11 +736,10 @@ def main() -> None:
     previous_pose: Optional[np.ndarray] = None
     previous_scale: Optional[float] = None
     previous_ts_num: Optional[int] = None
-    first_unloaded_frame = len(resume_poses) == 0  # False if any frames were already loaded from JSON.
+    first_unloaded_frame = len(resume_poses) == 0
 
     # Skip timestamps before the specified resume point and seed previous_pose from JSON.
     if args.resume_from_timestamp is not None:
-        # Accept both zero-padded (timestamp_0240) and unpadded (timestamp_240) forms.
         resume_ts = args.resume_from_timestamp
         if resume_ts not in timestamp_names:
             try:
@@ -712,19 +751,34 @@ def main() -> None:
                     f"Available range: {timestamp_names[0]} – {timestamp_names[-1]}"
                 )
         start_idx = timestamp_names.index(resume_ts)
-        skipped_names = timestamp_names[:start_idx]
         timestamp_names = timestamp_names[start_idx:]
-        first_unloaded_frame = True  # Treat resume point as a fresh start.
-        # Initialize previous_pose from the last available pre-resume entry in JSON.
-        for ts in reversed(skipped_names):
-            if ts in resume_poses:
-                entry = resume_poses[ts]
+        # Seed previous_pose from the JSON directly (not from skipped_names), so that
+        # --timestamp-start > 0 doesn't cause skipped_names to be empty.
+        # Priority 1: latest entry strictly before resume_ts_num.
+        # Priority 2: if resume_ts itself is in the JSON, use it as prior and skip it
+        #             (treat it as already done, start from the next timestamp).
+        resume_ts_num = int(resume_ts.split("_")[-1])
+        for ts, entry in sorted(resume_poses.items(), key=lambda x: int(x[0].split("_")[-1]), reverse=True):
+            if int(ts.split("_")[-1]) < resume_ts_num:
                 previous_pose = np.array(entry["pose_matrix"], dtype=np.float32)
                 previous_scale = float(entry.get("scale", args.init_scale))
+                previous_ts_num = int(ts.split("_")[-1])
                 print(f"[resume] Initialized pose from '{ts}' (last pre-resume timestamp in JSON).")
                 break
-        print(f"[resume] Starting from '{args.resume_from_timestamp}' (skipped {start_idx} timestamps).")
-        # Clear resume_poses so timestamps from the resume point onward are re-optimized, not loaded from JSON.
+        if previous_pose is None and resume_ts in resume_poses:
+            # resume_ts itself is in the JSON but nothing before it: treat it as already
+            # optimized, use it as prior, and skip it so we start from the next timestamp.
+            entry = resume_poses[resume_ts]
+            previous_pose = np.array(entry["pose_matrix"], dtype=np.float32)
+            previous_scale = float(entry.get("scale", args.init_scale))
+            previous_ts_num = resume_ts_num
+            timestamp_names = timestamp_names[1:]  # skip resume_ts itself
+            print(f"[resume] '{resume_ts}' found in JSON — using it as prior, starting from next timestamp.")
+        # If we seeded previous_pose from JSON, ICP can initialize the first frame well → iters_rest.
+        # If not (no matching entry found), treat as a cold start → iters.
+        first_unloaded_frame = previous_pose is None
+        print(f"[resume] Starting from '{timestamp_names[0] if timestamp_names else resume_ts}' "
+              f"(prior: timestamp_{previous_ts_num if previous_ts_num is not None else 'none'}).")
         resume_poses = {}
 
     ts_pbar = tqdm(timestamp_names, desc="timestamps", dynamic_ncols=True)
@@ -750,11 +804,15 @@ def main() -> None:
             tqdm.write(f"Skipping {timestamp_name}: no valid masked views.")
             continue
 
+        ts_num = int(timestamp_name.split("_")[-1])
+
         # Determine iteration count.
-        # If tracking data is available, always use adaptive iters (including the first unloaded frame).
-        # Otherwise, first unloaded frame uses args.iters and the rest use args.iters_rest.
-        if tracking_data is not None:
-            ts_num = int(timestamp_name.split("_")[-1])
+        if first_unloaded_frame:
+            # Cold start (no prior pose): always use full iters regardless of adaptive.
+            frame_iters = args.iters
+            first_unloaded_frame = False
+            tqdm.write(f"[{timestamp_name}] cold start → iters={frame_iters}")
+        elif tracking_data is not None:
             track_t = min(ts_num, tracking_data[0].shape[0] - 1)
             track_t_prev = min(previous_ts_num, tracking_data[0].shape[0] - 1) if previous_ts_num is not None else None
             motion = compute_motion_magnitude(tracking_data[0], tracking_data[1], track_t, track_t_prev)
@@ -762,15 +820,25 @@ def main() -> None:
                 motion, args.iters_rest, args.iters_adaptive_max, args.motion_lo, args.motion_hi
             )
             tqdm.write(f"[{timestamp_name}] motion={motion:.5f}m  iters={frame_iters}")
-            first_unloaded_frame = False
-        elif first_unloaded_frame:
-            frame_iters = args.iters
-            first_unloaded_frame = False
         else:
             frame_iters = args.iters_rest
 
+        # Determine initial pose.
+        init_method = "fallback"
         if previous_pose is not None:
-            init_pose = previous_pose
+            # Try ICP-based initialization: propagate previous pose forward using relative poses.
+            icp_init_pose = None
+            if icp_rel is not None and previous_ts_num is not None:
+                composed = compose_relative_poses(icp_rel, previous_ts_num, ts_num)
+                if composed is not None:
+                    icp_init_pose = composed @ previous_pose
+                    init_method = f"icp(frames {previous_ts_num}->{ts_num})"
+
+            if icp_init_pose is not None:
+                init_pose = icp_init_pose
+            else:
+                init_pose = previous_pose
+                init_method = "prev_pose"
         elif not args.use_traj_init:
             init_pose = depth_init_pose(
                 args.depth_root,
@@ -784,18 +852,21 @@ def main() -> None:
                 init_pose = np.eye(4, dtype=np.float32)
             if args.debug_projection and idx == 0:
                 debug_projection(init_pose[:3, 3], camera_infos, args.mask_root, timestamp_name)
+            init_method = "depth"
         else:
             init_pose = init_poses[idx]
-        ts_pbar.set_description(f"{timestamp_name} ({len(frame_views)} views)")
+            init_method = "traj"
+
+        ts_pbar.set_description(f"{timestamp_name} ({len(frame_views)} views, init={init_method})")
         pose, renders, loss, loss_history, scale = optimize_pose_for_views(
             mesh, frame_views, init_pose, args,
             init_scale=previous_scale,
             iters=frame_iters,
         )
-        tqdm.write(f"[{timestamp_name}] loss={loss:.5f}  scale={scale:.4f}  t={pose[:3,3].round(3).tolist()}")
+        tqdm.write(f"[{timestamp_name}] init={init_method}  loss={loss:.5f}  scale={scale:.4f}  t={pose[:3,3].round(3).tolist()}")
         previous_pose = pose
         previous_scale = scale
-        previous_ts_num = int(timestamp_name.split("_")[-1])
+        previous_ts_num = ts_num
         solved_timestamp_names.append(timestamp_name)
         solved_poses.append(pose)
         solved_losses.append(loss)

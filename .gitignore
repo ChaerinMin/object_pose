@@ -10,3 +10,7 @@ pytorch3d-0.7.8.tar.gz
 pytorch3d-0.7.8/
 __pycache__/
 outputs/
+output_*
+outputs_*
+result_cylinder_1.npz
+cylinder_poses_kabsch_trackscaled_1.0.npz
