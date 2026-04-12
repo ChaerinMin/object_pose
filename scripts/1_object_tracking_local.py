@@ -111,9 +111,13 @@ def _load_depth_bundle(depth_root: Path, timestamp_name: str):
     list_path = depth_root / timestamp_name / "depths" / "exports" / "npz" / "results.txt"
     if not npz_path.exists() or not list_path.exists():
         return None
-    bundle = np.load(npz_path, allow_pickle=True)
-    with list_path.open("r", encoding="utf-8") as f:
-        names = [Path(line.strip()).stem for line in f if line.strip()]
+    try:
+        bundle = np.load(npz_path, allow_pickle=True)
+        with list_path.open("r", encoding="utf-8") as f:
+            names = [Path(line.strip()).stem for line in f if line.strip()]
+    except Exception as e:
+        print(f"Warning: failed to load depth bundle for {timestamp_name}: {e}")
+        return None
     return bundle, names
 
 
@@ -276,8 +280,13 @@ def make_collage(images_bgr: Sequence[np.ndarray]) -> np.ndarray:
     num_images = len(images_bgr)
     cols = math.ceil(math.sqrt(num_images))
     rows = math.ceil(num_images / cols)
-    blank = np.zeros_like(images_bgr[0])
-    padded = list(images_bgr) + [blank] * (rows * cols - num_images)
+    ref_h, ref_w = images_bgr[0].shape[:2]
+    normalized = [
+        cv2.resize(img, (ref_w, ref_h)) if img.shape[:2] != (ref_h, ref_w) else img
+        for img in images_bgr
+    ]
+    blank = np.zeros((ref_h, ref_w, 3), dtype=np.uint8)
+    padded = normalized + [blank] * (rows * cols - num_images)
     rows_out = []
     for row_idx in range(rows):
         rows_out.append(np.concatenate(padded[row_idx * cols:(row_idx + 1) * cols], axis=1))
@@ -751,9 +760,12 @@ def main() -> None:
             continue
 
         # Determine iteration count.
-        # If tracking data is available, always use adaptive iters (including the first unloaded frame).
-        # Otherwise, first unloaded frame uses args.iters and the rest use args.iters_rest.
-        if tracking_data is not None:
+        # First unloaded frame always uses args.iters regardless of tracking data.
+        # Subsequent frames use adaptive iters if tracking data is available, otherwise args.iters_rest.
+        if first_unloaded_frame:
+            frame_iters = args.iters
+            first_unloaded_frame = False
+        elif tracking_data is not None:
             ts_num = int(timestamp_name.split("_")[-1])
             track_t = min(ts_num, tracking_data[0].shape[0] - 1)
             track_t_prev = min(previous_ts_num, tracking_data[0].shape[0] - 1) if previous_ts_num is not None else None
@@ -762,10 +774,6 @@ def main() -> None:
                 motion, args.iters_rest, args.iters_adaptive_max, args.motion_lo, args.motion_hi
             )
             tqdm.write(f"[{timestamp_name}] motion={motion:.5f}m  iters={frame_iters}")
-            first_unloaded_frame = False
-        elif first_unloaded_frame:
-            frame_iters = args.iters
-            first_unloaded_frame = False
         else:
             frame_iters = args.iters_rest
 
@@ -802,15 +810,27 @@ def main() -> None:
         solved_scales.append(scale)
         save_loss_plot(output_dirs["poses"] / "loss_plots" / f"{timestamp_name}.png", loss_history)
 
+        view_render_map = {
+            view["cam_name"]: (view, render_rgba)
+            for view, render_rgba in zip(frame_views, renders)
+        }
         tiles = []
-        for view, render_rgba in zip(frame_views, renders):
-            overlay = alpha_blend_rgb(view["rgb"], render_rgba)
-            tile = annotate_tile(overlay, view["cam_name"], view["mask_pixels"])
+        for camera_info in camera_infos:
+            cam_name = camera_info["cam_name"]
+            out_hw = (int(camera_info["H"] / args.down), int(camera_info["W"] / args.down))
+            if cam_name in view_render_map:
+                view, render_rgba = view_render_map[cam_name]
+                overlay = alpha_blend_rgb(view["rgb"], render_rgba)
+                tile = annotate_tile(overlay, cam_name, view["mask_pixels"])
+                if args.save_per_timestamp:
+                    camera_dir = output_dirs["overlays"] / timestamp_name
+                    camera_dir.mkdir(parents=True, exist_ok=True)
+                    cv2.imwrite(str(camera_dir / f"{cam_name}.jpg"), tile)
+            else:
+                blank = np.full((*out_hw, 3), 255, dtype=np.uint8)
+                cv2.putText(blank, cam_name, (16, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (30, 255, 30), 2, cv2.LINE_AA)
+                tile = blank
             tiles.append(tile)
-            if args.save_per_timestamp:
-                camera_dir = output_dirs["overlays"] / timestamp_name
-                camera_dir.mkdir(parents=True, exist_ok=True)
-                cv2.imwrite(str(camera_dir / f"{view['cam_name']}.jpg"), tile)
 
         collage = make_collage(tiles)
         cv2.putText(collage, f"{timestamp_name} loss={loss:.6f} scale={scale:.4f}", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 255), 2, cv2.LINE_AA)

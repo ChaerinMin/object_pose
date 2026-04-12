@@ -10,7 +10,7 @@
             "console": "integratedTerminal",
             "justMyCode": false,
             "args":[
-                "--seq_root", "/oscar/data/ssrinath/public/brics-mini/2026-04-06/multisequence000001_safe",
+                "--seq-root", "/oscar/data/ssrinath/public/brics-mini/2026-04-06/multisequence000001_safe",
                 "--mesh-path", "/oscar/data/ssrinath/public/brics-mini-copy/obj_assets/3_30_2026.obj",
                 "--timestamp-start", "0",
                 "--timestamp-end", "-1",
