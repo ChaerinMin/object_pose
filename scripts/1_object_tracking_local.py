@@ -75,6 +75,8 @@ def build_argparser() -> argparse.ArgumentParser:
         default=1.0,
         help="Scale factor applied to the mesh (default 1.0 = unit scale).",
     )
+    parser.add_argument("--fix-scale-after-first", action="store_true",
+        help="After the first frame is optimized, freeze the learned scale for all subsequent frames.")
     parser.add_argument("--save-per-timestamp", action="store_true")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     # Resume from a specific timestamp (skip all earlier ones).
@@ -425,6 +427,7 @@ def optimize_pose_for_views(
     args: argparse.Namespace,
     init_scale: Optional[float] = None,
     iters: Optional[int] = None,
+    fix_scale: bool = False,
 ) -> Tuple[np.ndarray, List[np.ndarray], float, List[float], float]:
     device = mesh.device
     init_quat = quaternion_from_matrix(init_pose[:3, :3]).to(device)
@@ -452,13 +455,13 @@ def optimize_pose_for_views(
         init_scale=init_scale,
     ).to(device)
 
-    optimizer = torch.optim.Adam(
-        [
-            {"params": [model.mesh_rotation], "lr": args.lr_rot},
-            {"params": [model.mesh_translation], "lr": args.lr_trans},
-            {"params": [model.log_mesh_scale], "lr": args.lr_scale},
-        ]
-    )
+    param_groups = [
+        {"params": [model.mesh_rotation], "lr": args.lr_rot},
+        {"params": [model.mesh_translation], "lr": args.lr_trans},
+    ]
+    if not fix_scale:
+        param_groups.append({"params": [model.log_mesh_scale], "lr": args.lr_scale})
+    optimizer = torch.optim.Adam(param_groups)
 
     best_loss = float("inf")
     best_pose = init_pose.astype(np.float32).copy()
@@ -706,6 +709,7 @@ def main() -> None:
     previous_scale: Optional[float] = None
     previous_ts_num: Optional[int] = None
     first_unloaded_frame = len(resume_poses) == 0  # False if any frames were already loaded from JSON.
+    fixed_scale: Optional[float] = None  # Set after first frame when --fix-scale-after-first is used.
 
     # Skip timestamps before the specified resume point and seed previous_pose from JSON.
     if args.resume_from_timestamp is not None:
@@ -795,11 +799,16 @@ def main() -> None:
         else:
             init_pose = init_poses[idx]
         ts_pbar.set_description(f"{timestamp_name} ({len(frame_views)} views)")
+        use_fixed_scale = args.fix_scale_after_first and fixed_scale is not None
         pose, renders, loss, loss_history, scale = optimize_pose_for_views(
             mesh, frame_views, init_pose, args,
-            init_scale=previous_scale,
+            init_scale=fixed_scale if use_fixed_scale else previous_scale,
             iters=frame_iters,
+            fix_scale=use_fixed_scale,
         )
+        if args.fix_scale_after_first and fixed_scale is None:
+            fixed_scale = scale
+            tqdm.write(f"[{timestamp_name}] Scale fixed at {fixed_scale:.4f} for all subsequent frames.")
         tqdm.write(f"[{timestamp_name}] loss={loss:.5f}  scale={scale:.4f}  t={pose[:3,3].round(3).tolist()}")
         previous_pose = pose
         previous_scale = scale
