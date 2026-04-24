@@ -79,6 +79,8 @@ def build_argparser() -> argparse.ArgumentParser:
         help="After the first frame is optimized, freeze the learned scale for all subsequent frames.")
     parser.add_argument("--save-per-timestamp", action="store_true")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--kp3d-reproj-thresh", type=float, default=50.0,
+        help="Exclude cameras whose kp3d_reproj_error in image_confidence.json exceeds this threshold. 0 to disable.")
     # Resume from a specific timestamp (skip all earlier ones).
     parser.add_argument("--resume-from-timestamp", type=str, default=None,
         help="Timestamp name (e.g. 'timestamp_0142') to resume from. All earlier timestamps are skipped.")
@@ -672,6 +674,25 @@ def main() -> None:
     camera_infos = load_camera_infos(args.calib_root)
     if not camera_infos:
         raise RuntimeError(f"No cameras loaded from {args.calib_root}.")
+
+    # Filter out cameras with high kp3d reprojection error.
+    if args.kp3d_reproj_thresh > 0:
+        img_conf_path = args.calib_root / "image_confidence.json"
+        if img_conf_path.exists():
+            with open(img_conf_path, "r", encoding="utf-8") as _f:
+                img_conf = json.load(_f)
+            bad_cams = {
+                k.replace(".jpg", "")
+                for k, v in img_conf.items()
+                if "kp3d_reproj_error" in v and (
+                    v["kp3d_reproj_error"] < 0 or v["kp3d_reproj_error"] > args.kp3d_reproj_thresh
+                )
+            }
+            if bad_cams:
+                print(f"Excluding {len(bad_cams)} cameras with kp3d_reproj_error > {args.kp3d_reproj_thresh}px: {sorted(bad_cams)}")
+                camera_infos = [ci for ci in camera_infos if ci["cam_name"] not in bad_cams]
+        else:
+            print(f"Warning: image_confidence.json not found at {img_conf_path}. Skipping kp3d filter.")
 
     init_poses = None
     if args.use_traj_init:
