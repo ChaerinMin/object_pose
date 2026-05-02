@@ -25,6 +25,11 @@ import src.utils.colmap_utils as colmap_utils
 from src.utils.pytorch3d_utils import setup_renderer, DRModel, check_for_nan_params, visualize_image_list, alpha_blend
 
 from pytorch3d.io import load_objs_as_meshes
+from pytorch3d.structures import Meshes
+import trimesh
+
+
+NORMALIZED_MESH_EXTENT = 0.1  # meters; longest AABB side after normalization
 
 
 SEQ_MASK_SUBPATH = "outputs/sam3"
@@ -374,11 +379,33 @@ def load_camera_infos(calib_root: Path) -> List[Dict]:
     return sorted(infos, key=lambda info: info["cam_name"])
 
 
+def normalize_verts(verts: torch.Tensor) -> torch.Tensor:
+    """Center at origin and rescale so longest AABB side == NORMALIZED_MESH_EXTENT."""
+    aabb_min = verts.min(dim=0).values
+    aabb_max = verts.max(dim=0).values
+    center = 0.5 * (aabb_min + aabb_max)
+    extent = float((aabb_max - aabb_min).max().item())
+    if extent <= 0:
+        return verts - center
+    return (verts - center) * (NORMALIZED_MESH_EXTENT / extent)
+
+
 def load_mesh(mesh_path: Path, device: str, scale: float):
-    mesh = load_objs_as_meshes([str(mesh_path)], device=device)
+    suffix = mesh_path.suffix.lower()
+    if suffix == ".obj":
+        mesh = load_objs_as_meshes([str(mesh_path)], device=device)
+    elif suffix in (".glb", ".gltf"):
+        tm = trimesh.load(str(mesh_path), force="mesh", process=False)
+        verts_t = torch.as_tensor(np.asarray(tm.vertices), dtype=torch.float32, device=device)
+        faces_t = torch.as_tensor(np.asarray(tm.faces), dtype=torch.int64, device=device)
+        mesh = Meshes(verts=[verts_t], faces=[faces_t])
+    else:
+        raise ValueError(f"Unsupported mesh format '{suffix}'. Use .obj, .glb, or .gltf.")
+
+    verts = normalize_verts(mesh.verts_list()[0])
     if abs(scale - 1.0) > 1e-6:
-        verts = mesh.verts_list()[0] * scale
-        mesh = mesh.update_padded(verts[None])
+        verts = verts * scale
+    mesh = mesh.update_padded(verts[None])
     return mesh
 
 
