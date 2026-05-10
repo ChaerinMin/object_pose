@@ -29,7 +29,8 @@ from pytorch3d.structures import Meshes
 import trimesh
 
 
-NORMALIZED_MESH_EXTENT = 0.1  # meters; longest AABB side after normalization
+NORMALIZED_MESH_EXTENT = 0.15  # meters; target longest AABB side for unit-scale meshes
+UNIT_SCALE_THRESHOLD = 0.8  # m; only meshes with longest AABB side >= this are rescaled
 
 
 SEQ_MASK_SUBPATH = "outputs/sam3"
@@ -37,7 +38,7 @@ SEQ_PARSED_SUBPATH = "parsed"
 SEQ_CALIB_SUBPATH = "calib"
 SEQ_DEPTH_SUBPATH = "outputs/da3"
 SEQ_TRACKING_SUBPATH = "outputs/tracking/result.npz"
-SEQ_OUTPUT_SUBPATH = "outputs/object_pose"
+SEQ_OUTPUT_SUBPATH = "outputs/object_pose/diff_render"
 POSES_JSON_SUBPATH = "poses/optimized_poses.json"
 
 
@@ -115,19 +116,83 @@ def load_mask(mask_path: Path) -> Optional[np.ndarray]:
     return np.any(np.stack(masks, axis=0), axis=0)
 
 
+_compressed_depth_cache: Dict[str, Tuple[np.ndarray, np.ndarray, np.ndarray, List[str]]] = {}
+
+
+def _load_compressed_depths(depth_root: Path):
+    """Decode all depth_<cam>.mkv videos in depths_compressed/ into a (V, T, H, W) float32 array.
+
+    Returns (depths, intrinsics (V,3,3), extrinsics (V,3,4), cam_stems).
+    Cached per depth_root to avoid re-decoding.
+    """
+    key = str(depth_root.resolve())
+    if key in _compressed_depth_cache:
+        return _compressed_depth_cache[key]
+
+    compressed_dir = depth_root / "depths_compressed"
+    calib_npz_path = compressed_dir / "calib.npz"
+    cam_names_path = compressed_dir / "cam_names.txt"
+    depth_range_path = compressed_dir / "depth_range.npy"
+    if not (calib_npz_path.exists() and cam_names_path.exists() and depth_range_path.exists()):
+        raise FileNotFoundError(f"Compressed depth store missing at {compressed_dir}")
+
+    import av  # type: ignore
+
+    calib = np.load(calib_npz_path)
+    intrinsics = np.asarray(calib["intrinsics"], dtype=np.float32)
+    extrinsics = np.asarray(calib["extrinsics"], dtype=np.float32)
+    depth_range = np.load(depth_range_path).astype(np.float32)
+    with cam_names_path.open() as f:
+        cam_stems = [line.strip() for line in f if line.strip()]
+
+    decoded: List[Optional[np.ndarray]] = []
+    for vi, stem in enumerate(cam_stems):
+        mkv = compressed_dir / f"depth_{stem}.mkv"
+        if not mkv.exists():
+            decoded.append(None)
+            continue
+        d_min, d_max = float(depth_range[vi, 0]), float(depth_range[vi, 1])
+        with av.open(str(mkv)) as container:
+            frames = [frame.to_ndarray() for frame in container.decode(video=0)]
+        if not frames:
+            decoded.append(None)
+            continue
+        arr = np.stack(frames, axis=0).astype(np.float32)
+        decoded.append(arr / 4095.0 * (d_max - d_min) + d_min)
+
+    valid = [d for d in decoded if d is not None]
+    if not valid:
+        raise RuntimeError(f"No depth frames decoded from {compressed_dir}")
+    T = max(d.shape[0] for d in valid)
+    H, W = valid[0].shape[1:]
+    depths = np.zeros((len(cam_stems), T, H, W), dtype=np.float32)
+    for vi, d in enumerate(decoded):
+        if d is not None:
+            depths[vi, : d.shape[0]] = d
+
+    result = (depths, intrinsics, extrinsics, cam_stems)
+    _compressed_depth_cache[key] = result
+    return result
+
+
 def _load_depth_bundle(depth_root: Path, timestamp_name: str):
-    npz_path = depth_root / timestamp_name / "depths" / "exports" / "npz" / "results.npz"
-    list_path = depth_root / timestamp_name / "depths" / "exports" / "npz" / "results.txt"
-    if not npz_path.exists() or not list_path.exists():
-        return None
+    """Load per-timestamp depth from the compressed store. Raises on any read failure."""
+    depths_all, intrinsics, extrinsics, cam_stems = _load_compressed_depths(depth_root)
     try:
-        bundle = np.load(npz_path, allow_pickle=True)
-        with list_path.open("r", encoding="utf-8") as f:
-            names = [Path(line.strip()).stem for line in f if line.strip()]
-    except Exception as e:
-        print(f"Warning: failed to load depth bundle for {timestamp_name}: {e}")
-        return None
-    return bundle, names
+        ts_idx = int(timestamp_name.split("_")[-1])
+    except ValueError as exc:
+        raise RuntimeError(f"Cannot parse timestamp index from '{timestamp_name}'") from exc
+    if ts_idx < 0 or ts_idx >= depths_all.shape[1]:
+        raise RuntimeError(
+            f"Timestamp index {ts_idx} out of range [0, {depths_all.shape[1]}) "
+            f"for compressed depth store at {depth_root / 'depths_compressed'}"
+        )
+    bundle = {
+        "depth": depths_all[:, ts_idx],
+        "intrinsics": intrinsics,
+        "extrinsics": extrinsics,
+    }
+    return bundle, cam_stems
 
 
 def depth_init_pose(
@@ -138,10 +203,7 @@ def depth_init_pose(
     max_points: int,
     camera_infos: Optional[Sequence[Dict]] = None,
 ) -> Optional[np.ndarray]:
-    loaded = _load_depth_bundle(depth_root, timestamp_name)
-    if loaded is None:
-        return None
-    bundle, names = loaded
+    bundle, names = _load_depth_bundle(depth_root, timestamp_name)
     depth = bundle["depth"]
     intrs = bundle["intrinsics"]
     extrs = bundle["extrinsics"]
@@ -380,14 +442,16 @@ def load_camera_infos(calib_root: Path) -> List[Dict]:
 
 
 def normalize_verts(verts: torch.Tensor) -> torch.Tensor:
-    """Center at origin and rescale so longest AABB side == NORMALIZED_MESH_EXTENT."""
+    """Rescale only when the mesh appears to be unit-scale (longest AABB side
+    >= UNIT_SCALE_THRESHOLD): scale longest side to NORMALIZED_MESH_EXTENT.
+    Translation is never modified; meshes already in metric scale are returned as-is.
+    """
     aabb_min = verts.min(dim=0).values
     aabb_max = verts.max(dim=0).values
-    center = 0.5 * (aabb_min + aabb_max)
     extent = float((aabb_max - aabb_min).max().item())
-    if extent <= 0:
-        return verts - center
-    return (verts - center) * (NORMALIZED_MESH_EXTENT / extent)
+    if extent < UNIT_SCALE_THRESHOLD:
+        return verts
+    return verts * (NORMALIZED_MESH_EXTENT / extent)
 
 
 def load_mesh(mesh_path: Path, device: str, scale: float):
@@ -841,7 +905,9 @@ def main() -> None:
                 camera_infos,
             )
             if init_pose is None:
-                init_pose = np.eye(4, dtype=np.float32)
+                raise RuntimeError(
+                    f"[{timestamp_name}] depth init failed: no valid (mask, depth>0) pixels in any view."
+                )
             if args.debug_projection and idx == 0:
                 debug_projection(init_pose[:3, 3], camera_infos, args.mask_root, timestamp_name)
         else:
