@@ -25,6 +25,22 @@
             ]
         },
         {
+            "name": "Object Tracking FoundationPose",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "scripts.1_object_tracking_foundationpose",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "args":[
+                "--seq-root", "/oscar/data/ssrinath/public/brics-mini/2026-05-09_0cm_1/multisequence000001",
+                "--mesh-path", "/oscar/data/ssrinath/users/cmin5/non-rigid-hoi/object_meshes/rectangle_textured.glb",
+                "--timestamp-start", "0",
+                "--timestamp-end", "-1",
+                "--timestamp-step", "1",
+                "--depth-extr-inv",
+            ]
+        },
+        {
             "name": "Object Tracking ICP Init",
             "type": "debugpy",
             "request": "launch",

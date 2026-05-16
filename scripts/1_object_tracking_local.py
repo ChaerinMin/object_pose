@@ -966,7 +966,7 @@ def main() -> None:
 
     save_pose_json(output_dirs["poses"] / "optimized_poses.json", solved_timestamp_names, solved_poses, solved_losses, solved_scales)
     np.save(output_dirs["poses"] / "optimized_poses.npy", np.stack(solved_poses))
-    write_video(output_dirs["videos"] / "multiview_pose_collage.mp4", all_collages, fps=10, frames_are_bgr=True)
+    write_video(output_dirs["videos"] / "multiview_pose_collage.mp4", all_collages, fps=30, frames_are_bgr=True)
 
     print(f"Saved {len(solved_poses)} optimized poses to {output_dirs['poses'] / 'optimized_poses.json'}")
     print(f"Saved collage video to {output_dirs['videos'] / 'multiview_pose_collage.mp4'}")
