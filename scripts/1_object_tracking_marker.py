@@ -43,6 +43,8 @@ import argparse
 import json
 import math
 import sys
+import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -346,6 +348,22 @@ def umeyama(src: np.ndarray, dst: np.ndarray, fix_scale: Optional[float] = None
 
 
 # ── Per-timestamp pipeline ─────────────────────────────────────────────────────
+def _read_and_detect_one(
+    image_dir: Path, cam: Dict,
+    detector_or_dict, detector_params,
+    layout_meshframe: Dict[int, np.ndarray],
+) -> Tuple[str, Optional[Dict[int, np.ndarray]]]:
+    cam_name = cam["cam_name"]
+    img_path = image_dir / f"{cam_name}.jpg"
+    if not img_path.exists():
+        return cam_name, None
+    bgr = cv2.imread(str(img_path), cv2.IMREAD_COLOR)
+    if bgr is None:
+        return cam_name, None
+    det = detect_markers(bgr, detector_or_dict, detector_params)
+    return cam_name, {mid: c for mid, c in det.items() if mid in layout_meshframe}
+
+
 def fit_pose_for_timestamp(
     timestamp_name: str,
     parsed_root: Path,
@@ -354,6 +372,7 @@ def fit_pose_for_timestamp(
     detector_or_dict,
     detector_params,
     args: argparse.Namespace,
+    executor: ThreadPoolExecutor,
     fix_scale: Optional[float] = None,
 ) -> Optional[Dict]:
     image_dir = parsed_root / timestamp_name / "images"
@@ -361,18 +380,18 @@ def fit_pose_for_timestamp(
         return None
 
     detections: Dict[str, Dict[int, np.ndarray]] = {}
-    rgb_cache: Dict[str, np.ndarray] = {}
-    for cam in camera_infos:
-        img_path = image_dir / f"{cam['cam_name']}.jpg"
-        if not img_path.exists():
+    futures = [
+        executor.submit(
+            _read_and_detect_one, image_dir, cam,
+            detector_or_dict, detector_params, layout_meshframe,
+        )
+        for cam in camera_infos
+    ]
+    for fut in futures:
+        cam_name, det = fut.result()
+        if det is None:
             continue
-        bgr = cv2.imread(str(img_path), cv2.IMREAD_COLOR)
-        if bgr is None:
-            continue
-        det = detect_markers(bgr, detector_or_dict, detector_params)
-        det = {mid: c for mid, c in det.items() if mid in layout_meshframe}
-        detections[cam["cam_name"]] = det
-        rgb_cache[cam["cam_name"]] = bgr
+        detections[cam_name] = det
 
     cam_by_name = {c["cam_name"]: c for c in camera_infos}
     proj_cache = {name: make_projection_matrix(c) for name, c in cam_by_name.items()}
@@ -434,7 +453,6 @@ def fit_pose_for_timestamp(
         "num_views_total": len(detections),
         "num_views_with_marker": sum(1 for d in detections.values() if d),
         "detections": detections,
-        "rgb_cache": rgb_cache,
         "used_keys": used_keys,
     }
 
@@ -658,53 +676,66 @@ def main() -> None:
 
     detector_or_dict, detector_params = make_detector(dict_id)
 
-    solved_names: List[str] = []
-    solved_poses: List[np.ndarray] = []
-    solved_losses: List[float] = []
-    solved_scales: List[float] = []
-    all_collages: List[np.ndarray] = []
+    # ── Phase 1: pure pose tracking. No per-frame visualization or JSON.
+    fits: Dict[str, Dict] = {}
     fixed_scale: Optional[float] = None
+    n_workers = max(1, min(len(camera_infos), 16))
 
-    ts_pbar = tqdm(timestamp_names, desc="timestamps", dynamic_ncols=True)
-    for timestamp_name in ts_pbar:
-        result = fit_pose_for_timestamp(
-            timestamp_name, parsed_root, camera_infos, layout_meshframe,
-            detector_or_dict, detector_params, args,
-            fix_scale=fixed_scale,
-        )
-        if result is None:
-            tqdm.write(f"[{timestamp_name}] Skipped (insufficient marker observations).")
-            continue
+    track_t0 = time.perf_counter()
+    with ThreadPoolExecutor(max_workers=n_workers) as executor:
+        ts_pbar = tqdm(timestamp_names, desc="tracking", dynamic_ncols=True)
+        for timestamp_name in ts_pbar:
+            result = fit_pose_for_timestamp(
+                timestamp_name, parsed_root, camera_infos, layout_meshframe,
+                detector_or_dict, detector_params, args,
+                executor=executor, fix_scale=fixed_scale,
+            )
+            if result is None:
+                tqdm.write(f"[{timestamp_name}] Skipped (insufficient marker observations).")
+                continue
+            scale = result["scale"]
+            loss = result["reproj_loss"]
+            if args.fix_scale_after_first and fixed_scale is None:
+                fixed_scale = scale
+                tqdm.write(f"[{timestamp_name}] Scale fixed at {fixed_scale:.4f} for subsequent frames.")
+            tqdm.write(
+                f"[{timestamp_name}] corresps={result['num_correspondences']}  "
+                f"reproj={loss:.2f}px  rmse_world={result['rmse_world']:.4f}  "
+                f"scale={scale:.4f}  views_with_marker={result['num_views_with_marker']}"
+            )
+            fits[timestamp_name] = result
+    pure_track_seconds = time.perf_counter() - track_t0
 
+    if not fits:
+        raise RuntimeError("No timestamps were successfully fit.")
+
+    solved_names = list(fits.keys())
+    solved_poses = [fits[n]["pose"].astype(np.float32) for n in solved_names]
+    solved_losses = [fits[n]["reproj_loss"] for n in solved_names]
+    solved_scales = [fits[n]["scale"] for n in solved_names]
+
+    # ── Phase 2: persist poses + render visualization (re-reads images).
+    save_pose_json(
+        output_root / "poses" / "optimized_poses.json",
+        solved_names, solved_poses, solved_losses, solved_scales,
+    )
+    np.save(output_root / "poses" / "optimized_poses.npy", np.stack(solved_poses))
+
+    all_collages: List[np.ndarray] = []
+    for ts_name in tqdm(solved_names, desc="visualization", dynamic_ncols=True):
+        result = fits[ts_name]
         pose = result["pose"].astype(np.float32)
         scale = result["scale"]
         loss = result["reproj_loss"]
-        if args.fix_scale_after_first and fixed_scale is None:
-            fixed_scale = scale
-            tqdm.write(f"[{timestamp_name}] Scale fixed at {fixed_scale:.4f} for subsequent frames.")
-
-        tqdm.write(
-            f"[{timestamp_name}] corresps={result['num_correspondences']}  "
-            f"reproj={loss:.2f}px  rmse_world={result['rmse_world']:.4f}  "
-            f"scale={scale:.4f}  views_with_marker={result['num_views_with_marker']}"
-        )
-        solved_names.append(timestamp_name)
-        solved_poses.append(pose)
-        solved_losses.append(loss)
-        solved_scales.append(scale)
-
-        # Per-frame collage: one tile per camera (blank for cameras with no
-        # detection / cached frame). Iterating over a fixed camera list keeps
-        # the collage size constant across frames so the encoder can mux it
-        # into a single video.
+        image_dir = parsed_root / ts_name / "images"
         tiles = []
         for cam in camera_infos:
             name = cam["cam_name"]
-            bgr = result["rgb_cache"].get(name)
+            img_path = image_dir / f"{name}.jpg"
+            bgr = cv2.imread(str(img_path), cv2.IMREAD_COLOR) if img_path.exists() else None
             det = result["detections"].get(name, {})
             if bgr is None:
-                blank = np.zeros((cam["H"], cam["W"], 3), dtype=np.uint8)
-                drawn = blank
+                drawn = np.zeros((cam["H"], cam["W"], 3), dtype=np.uint8)
             else:
                 drawn = draw_overlay(
                     bgr, det, cam, pose, scale, layout_meshframe,
@@ -714,28 +745,21 @@ def main() -> None:
         collage = make_collage(tiles)
         cv2.putText(
             collage,
-            f"{timestamp_name} reproj={loss:.2f}px corresps={result['num_correspondences']} scale={scale:.4f}",
+            f"{ts_name} reproj={loss:.2f}px corresps={result['num_correspondences']} scale={scale:.4f}",
             (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 255), 2, cv2.LINE_AA,
         )
+        cv2.imwrite(str(output_root / "collages" / f"{ts_name}.jpg"), collage)
         all_collages.append(collage)
-        cv2.imwrite(str(output_root / "collages" / f"{timestamp_name}.jpg"), collage)
 
-        save_pose_json(
-            output_root / "poses" / "optimized_poses.json",
-            solved_names, solved_poses, solved_losses, solved_scales,
-        )
+    write_video(output_root / "videos" / "multiview_pose_collage.mp4", all_collages, fps=30)
 
-    if not solved_poses:
-        raise RuntimeError("No timestamps were successfully fit.")
-
-    save_pose_json(
-        output_root / "poses" / "optimized_poses.json",
-        solved_names, solved_poses, solved_losses, solved_scales,
+    n_solved = len(fits)
+    fps = n_solved / pure_track_seconds if pure_track_seconds > 0 else float("nan")
+    print(
+        f"\nPure pose tracking time: {pure_track_seconds:.2f}s for {n_solved} frames "
+        f"({fps:.2f} fps, {n_workers} detection workers, {len(camera_infos)} cameras)"
     )
-    np.save(output_root / "poses" / "optimized_poses.npy", np.stack(solved_poses))
-    write_video(output_root / "videos" / "multiview_pose_collage.mp4", all_collages, fps=10)
-
-    print(f"Saved {len(solved_poses)} marker-fit poses to "
+    print(f"Saved {n_solved} marker-fit poses to "
           f"{output_root / 'poses' / 'optimized_poses.json'}")
 
 
